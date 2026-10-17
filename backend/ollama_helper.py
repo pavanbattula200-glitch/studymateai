@@ -1,8 +1,8 @@
 """
 StudyMate AI — Ollama / Local AI Helper
-Talks to the locally running Ollama service.
-If Ollama is not available, functions return a structured error
-instead of crashing — the rest of the backend continues to work.
+Connects to locally running Ollama via the /api/chat endpoint.
+Uses the model specified in .env (e.g. gemma4:latest).
+All operations run 100% locally and offline without external dependencies.
 """
 
 import json
@@ -12,8 +12,8 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
-# Timeout in seconds for AI inference calls
-INFERENCE_TIMEOUT = 120
+# Timeout in seconds for AI inference calls (local models can take 10-60s depending on hardware)
+INFERENCE_TIMEOUT = 180
 
 
 def get_base_url() -> str:
@@ -34,51 +34,60 @@ def get_available_models() -> list[str]:
 def resolve_model() -> str:
     """
     Resolve which model to use:
-    1. Try exact configured model from Config.OLLAMA_MODEL.
-    2. Try prefix/tag-insensitive match (e.g. 'gemma4' -> 'gemma4:latest').
-    3. If configured model is not found, fallback to first available installed model.
-    4. Otherwise return Config.OLLAMA_MODEL.
+    1. Read Config.OLLAMA_MODEL (from .env).
+    2. If matched against available models in Ollama, use it.
+    3. If tag is omitted (e.g. 'gemma4' vs 'gemma4:latest'), match appropriately.
+    4. Fall back to first installed model if configured model is missing.
     """
     configured = (Config.OLLAMA_MODEL or "").strip()
     available = get_available_models()
     if not available:
         return configured or "gemma4:latest"
 
-    # 1. Exact match
+    # Exact match
     if configured in available:
         return configured
 
-    # 2. Tag-insensitive match (e.g. 'gemma4' matching 'gemma4:latest')
+    # Match ignoring tag (e.g. 'gemma4' matches 'gemma4:latest')
     for m in available:
         base_name = m.split(":")[0]
         if configured == base_name or (":" in configured and configured.split(":")[0] == base_name):
             return m
 
-    # 3. Fallback to first available installed model
+    # Fallback to first available installed model
     return available[0]
 
 
-def _ollama_generate(prompt: str) -> dict:
+def _ollama_chat(messages: list[dict], format_type: str | None = None) -> dict:
     """
-    Call the Ollama /api/generate endpoint.
-    Returns {"ok": True, "text": "..."} or {"ok": False, "error": "..."}.
+    Call the Ollama /api/chat endpoint with stream: false.
+    Returns {"ok": True, "text": "...", "model": "..."} or {"ok": False, "error": "..."}.
     """
     base_url = get_base_url()
     model_to_use = resolve_model()
-    url = f"{base_url}/api/generate"
+    url = f"{base_url}/api/chat"
+
     payload = {
         "model": model_to_use,
-        "prompt": prompt,
+        "messages": messages,
         "stream": False,
+        "options": {
+            "temperature": 0.3,
+        },
     }
+    if format_type:
+        payload["format"] = format_type
 
     try:
         resp = requests.post(url, json=payload, timeout=INFERENCE_TIMEOUT)
+
         if resp.status_code == 200:
             data = resp.json()
-            return {"ok": True, "text": data.get("response", "").strip(), "model": model_to_use}
+            message_obj = data.get("message", {})
+            content = (message_obj.get("content") or "").strip()
+            return {"ok": True, "text": content, "model": model_to_use}
 
-        # Ollama returned non-200 (e.g. 404 model not found)
+        # Handle non-200 responses with clear messages
         error_msg = f"HTTP {resp.status_code}"
         try:
             err_json = resp.json()
@@ -86,10 +95,10 @@ def _ollama_generate(prompt: str) -> dict:
                 error_msg = err_json["error"]
         except Exception:
             if resp.text:
-                error_msg = resp.text
+                error_msg = resp.text[:200]
 
         available = get_available_models()
-        avail_str = ", ".join(available) if available else "none"
+        avail_str = ", ".join(available) if available else "none detected"
         return {
             "ok": False,
             "error": f"Ollama error: {error_msg}. Configured: '{Config.OLLAMA_MODEL}', Available in Ollama: [{avail_str}]",
@@ -99,18 +108,21 @@ def _ollama_generate(prompt: str) -> dict:
         return {
             "ok": False,
             "error": (
-                "Ollama is not running. Start it with: ollama serve  "
-                "Then pull a model: ollama pull gemma4"
+                "Ollama is not reachable on http://localhost:11434. "
+                "Make sure Ollama is running (`ollama serve`)."
             ),
         }
     except requests.exceptions.Timeout:
-        return {"ok": False, "error": "Ollama inference timed out. Try a smaller model or increase timeout."}
+        return {
+            "ok": False,
+            "error": "Ollama response timed out. The local model took too long to complete.",
+        }
     except Exception as exc:
-        return {"ok": False, "error": f"Ollama error: {exc}"}
+        return {"ok": False, "error": f"Ollama request error: {exc}"}
 
 
 def check_ollama() -> dict:
-    """Return a status dict describing whether Ollama + the model are available."""
+    """Return status dict describing whether Ollama and the configured model are available."""
     try:
         available = get_available_models()
         active = resolve_model()
@@ -133,31 +145,56 @@ def check_ollama() -> dict:
 
 
 def summarize(text: str) -> dict:
-    prompt = (
-        "You are a study assistant. Summarize the following notes clearly and concisely "
-        "in plain English. Focus on the key ideas. Do not add information not present in the notes.\n\n"
-        f"NOTES:\n{text}\n\nSUMMARY:"
-    )
-    result = _ollama_generate(prompt)
+    """Feature 1: Summarize Notes using local Gemma via /api/chat."""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert study assistant. Summarize the user's study notes clearly, "
+                "concisely, and accurately in well-structured paragraphs or bullet points. "
+                "Focus on the core ideas, definitions, and key takeaways. Do not invent information."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Please summarize the following study notes:\n\n{text}",
+        },
+    ]
+
+    result = _ollama_chat(messages)
     if result["ok"]:
         return {"ok": True, "summary": result["text"]}
     return result
 
 
 def explain(topic: str, context: str = "") -> dict:
-    ctx_part = f"\n\nAdditional context:\n{context}" if context.strip() else ""
-    prompt = (
-        f"Explain the concept '{topic}' in simple, clear language suitable for a student.{ctx_part}\n\n"
-        "Respond in this exact JSON format (no markdown, just JSON):\n"
-        '{"explanation": "...", "key_points": ["...", "..."], "example": "..."}'
-    )
-    result = _ollama_generate(prompt)
+    """Feature 2: Explain Concepts using local Gemma via /api/chat."""
+    ctx_instruction = f"\n\nContext to incorporate:\n{context}" if context.strip() else ""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert tutor. Explain academic and technical concepts in simple, "
+                "intuitive language suitable for students. Always output valid JSON matching this schema:\n"
+                '{"explanation": "...", "key_points": ["point 1", "point 2", ...], "example": "..."}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Explain the concept '{topic}'.{ctx_instruction}\n\n"
+                "Provide a clear explanation, 3-5 bullet key points, and a memorable real-world example."
+            ),
+        },
+    ]
+
+    result = _ollama_chat(messages, format_type="json")
     if not result["ok"]:
         return result
+
     try:
-        # Try to parse JSON from the model's response
         raw = result["text"]
-        # Strip any wrapping markdown code fences if present
+        # Strip potential markdown formatting if returned
         if "```" in raw:
             parts = raw.split("```")
             if len(parts) >= 2:
@@ -166,23 +203,48 @@ def explain(topic: str, context: str = "") -> dict:
                     raw = raw[4:]
                 raw = raw.strip()
         parsed = json.loads(raw)
-        return {"ok": True, **parsed}
-    except (json.JSONDecodeError, IndexError):
-        # Model didn't return clean JSON — return raw as explanation
-        return {"ok": True, "explanation": result["text"], "key_points": [], "example": ""}
+        return {
+            "ok": True,
+            "explanation": parsed.get("explanation", ""),
+            "key_points": parsed.get("key_points", []),
+            "example": parsed.get("example", ""),
+        }
+    except Exception:
+        # Graceful fallback if JSON parsing fails
+        return {
+            "ok": True,
+            "explanation": result["text"],
+            "key_points": [],
+            "example": "",
+        }
 
 
 def generate_quiz(topic: str, num_questions: int = 5, difficulty: str = "medium") -> dict:
-    prompt = (
-        f"Create a {difficulty} difficulty multiple-choice quiz about '{topic}'. "
-        f"Generate exactly {num_questions} questions. Each question must have exactly 4 options "
-        f"and one correct answer.\n\n"
-        "Respond in this exact JSON format (no markdown):\n"
-        '{"questions": [{"question": "...", "options": ["A", "B", "C", "D"], "correct_index": 0}, ...]}'
-    )
-    result = _ollama_generate(prompt)
+    """Feature 3: Generate Quiz questions using local Gemma via /api/chat."""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an academic test designer. Create multiple-choice quizzes that test understanding. "
+                "Each question must have exactly 4 plausible options (labeled in text or an array) "
+                "and an integer correct_index from 0 to 3 pointing to the correct option. "
+                "Always output valid JSON."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Create a {difficulty} difficulty quiz about '{topic}' with exactly {num_questions} questions.\n"
+                "Respond in this JSON format:\n"
+                '{"questions": [{"question": "...", "options": ["Option 1", "Option 2", "Option 3", "Option 4"], "correct_index": 0}]}'
+            ),
+        },
+    ]
+
+    result = _ollama_chat(messages, format_type="json")
     if not result["ok"]:
         return result
+
     try:
         raw = result["text"]
         if "```" in raw:
@@ -193,20 +255,34 @@ def generate_quiz(topic: str, num_questions: int = 5, difficulty: str = "medium"
                     raw = raw[4:]
                 raw = raw.strip()
         parsed = json.loads(raw)
-        return {"ok": True, "questions": parsed.get("questions", [])}
-    except (json.JSONDecodeError, IndexError):
-        return {"ok": False, "error": "The AI returned an unexpected format. Please try again."}
+        questions = parsed.get("questions", [])
+        return {"ok": True, "questions": questions}
+    except Exception:
+        return {"ok": False, "error": "The AI model returned an invalid quiz structure. Please try again."}
 
 
 def ask_notes(notes: str, question: str) -> dict:
-    prompt = (
-        "You are a study assistant. Answer the student's question using ONLY the notes provided. "
-        "If the answer is not in the notes, say so clearly.\n\n"
-        f"NOTES:\n{notes}\n\n"
-        f"QUESTION: {question}\n\n"
-        "ANSWER:"
-    )
-    result = _ollama_generate(prompt)
+    """Feature 4: Ask Your Notes (grounded Q&A) using local Gemma via /api/chat."""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a strict, helpful study assistant. Answer the student's question using "
+                "ONLY the notes provided. If the answer cannot be found or deduced from the notes, "
+                "state clearly: 'This information is not covered in your provided notes.'"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"NOTES:\n{notes}\n\n"
+                f"QUESTION:\n{question}\n\n"
+                "ANSWER:"
+            ),
+        },
+    ]
+
+    result = _ollama_chat(messages)
     if result["ok"]:
         return {"ok": True, "answer": result["text"]}
     return result
