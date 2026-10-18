@@ -1,0 +1,19 @@
+# Backend environment files
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+
+# Python cache & virtual environment
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+studymate.db

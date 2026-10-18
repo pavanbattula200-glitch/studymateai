@@ -5,14 +5,24 @@ Or:        gunicorn app:app
 """
 
 import os
+import sys
+import threading
 from datetime import timedelta
 from flask import Flask
 from flask_cors import CORS
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from config import Config
 from database import init_db
 from auth import auth_bp
 from routes import study_bp
+import ollama_helper
 
 
 def create_app() -> Flask:
@@ -31,7 +41,8 @@ def create_app() -> Flask:
         app,
         origins=Config.FRONTEND_ORIGINS,
         supports_credentials=True,   # required for session cookies
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+        expose_headers=["Content-Type"],
         methods=["GET", "POST", "DELETE", "OPTIONS"],
     )
 
@@ -43,6 +54,15 @@ def create_app() -> Flask:
     with app.app_context():
         init_db()
 
+    # Pre-warm model in background thread so offline inferences start without load delay
+    def _background_warmup():
+        try:
+            ollama_helper.warmup_model()
+        except Exception:
+            pass
+
+    threading.Thread(target=_background_warmup, daemon=True).start()
+
     return app
 
 
@@ -50,13 +70,13 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "1").lower() in ("1", "true")
+    port = Config.PORT
+    debug = Config.FLASK_DEBUG
 
     print("=" * 55)
-    print("  StudyMate AI — Flask Backend")
+    print("  StudyMate AI — Flask Backend (Offline Mode)")
     print(f"  URL : http://localhost:{port}")
     print("  DB  :", Config.DATABASE_PATH)
     print("  AI  :", Config.OLLAMA_BASE_URL, "/", Config.OLLAMA_MODEL)
     print("=" * 55)
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)

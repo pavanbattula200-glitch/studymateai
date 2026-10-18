@@ -7,28 +7,71 @@ All operations run 100% locally and offline without external dependencies.
 
 import json
 import logging
+import re
+import sys
+import time
 import requests
 from config import Config
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 logger = logging.getLogger(__name__)
 
-# Timeout in seconds for AI inference calls (local models can take 10-60s depending on hardware)
+# Timeout in seconds for AI inference calls (local models on CPU can take 30-90s)
 INFERENCE_TIMEOUT = 180
+
+# In-memory cache for available models to avoid spamming Ollama on every health poll
+_models_cache = {"timestamp": 0.0, "models": []}
+CACHE_TTL = 30.0  # seconds
 
 
 def get_base_url() -> str:
     return Config.OLLAMA_BASE_URL.rstrip("/")
 
 
-def get_available_models() -> list[str]:
-    """Fetch list of model names currently installed in local Ollama."""
+def get_available_models(force_refresh: bool = False) -> list[str]:
+    """Fetch list of model names currently installed in local Ollama with TTL caching."""
+    now = time.time()
+    if not force_refresh and (now - _models_cache["timestamp"] < CACHE_TTL) and _models_cache["models"]:
+        return _models_cache["models"]
+
     try:
         resp = requests.get(f"{get_base_url()}/api/tags", timeout=5)
         if resp.status_code == 200:
-            return [m.get("name", "") for m in resp.json().get("models", []) if m.get("name")]
+            models = [m.get("name", "") for m in resp.json().get("models", []) if m.get("name")]
+            _models_cache["timestamp"] = now
+            _models_cache["models"] = models
+            return models
+    except Exception:
+        pass
+    return _models_cache["models"]
+
+
+def get_loaded_models() -> list[dict]:
+    """Fetch currently loaded models in Ollama memory via /api/ps."""
+    try:
+        resp = requests.get(f"{get_base_url()}/api/ps", timeout=3)
+        if resp.status_code == 200:
+            return resp.json().get("models", [])
     except Exception:
         pass
     return []
+
+
+def is_model_warm(model_name: str | None = None) -> bool:
+    """Check if the model is currently active/warm in Ollama memory."""
+    target = model_name or resolve_model()
+    target_base = target.split(":")[0].lower()
+    for m in get_loaded_models():
+        name = (m.get("name") or m.get("model") or "").lower()
+        if name == target.lower() or name.split(":")[0] == target_base:
+            return True
+    return False
 
 
 def resolve_model() -> str:
@@ -54,13 +97,54 @@ def resolve_model() -> str:
         if configured == base_name or (":" in configured and configured.split(":")[0] == base_name):
             return m
 
+    # Substring / family match (e.g. 'gemma' or 'gemma4' matches 'gemma4:latest')
+    for m in available:
+        if configured.lower() in m.lower() or m.lower().startswith(configured.lower()):
+            return m
+
     # Fallback to first available installed model
     return available[0]
 
 
-def _ollama_chat(messages: list[dict], format_type: str | None = None) -> dict:
+def warmup_model() -> bool:
     """
-    Call the Ollama /api/chat endpoint with stream: false.
+    Pre-load the model into memory with a 60-minute keep-alive.
+    Can be run in a background thread on startup so subsequent inferences start immediately.
+    """
+    try:
+        model = resolve_model()
+        if is_model_warm(model):
+            return True
+        resp = requests.post(
+            f"{get_base_url()}/api/chat",
+            json={"model": model, "keep_alive": "60m"},
+            timeout=60,
+        )
+        return resp.status_code == 200
+    except Exception as exc:
+        logger.warning("Model warm-up skipped or failed: %s", exc)
+        return False
+
+
+def _clean_ai_text(text: str) -> str:
+    """Clean internal thinking blocks or whitespace from the response."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
+    return cleaned.strip()
+
+
+def _ollama_chat(
+    messages: list[dict],
+    format_type: str | None = None,
+    num_predict: int = 1024,
+    temperature: float = 0.3,
+) -> dict:
+    """
+    Call the Ollama /api/chat endpoint with stream: false, think: false, and keep_alive: 60m.
+    Disabling thinking prevents Gemma4 from consuming all tokens on internal reasoning
+    and returning an empty content block.
     Returns {"ok": True, "text": "...", "model": "..."} or {"ok": False, "error": "..."}.
     """
     base_url = get_base_url()
@@ -71,8 +155,11 @@ def _ollama_chat(messages: list[dict], format_type: str | None = None) -> dict:
         "model": model_to_use,
         "messages": messages,
         "stream": False,
+        "think": False,
+        "keep_alive": "60m",
         "options": {
-            "temperature": 0.3,
+            "temperature": temperature,
+            "num_predict": num_predict,
         },
     }
     if format_type:
@@ -84,7 +171,18 @@ def _ollama_chat(messages: list[dict], format_type: str | None = None) -> dict:
         if resp.status_code == 200:
             data = resp.json()
             message_obj = data.get("message", {})
-            content = (message_obj.get("content") or "").strip()
+            raw_content = message_obj.get("content") or ""
+            content = _clean_ai_text(raw_content)
+
+            # Fallback in case a model still placed output in thinking
+            if not content and message_obj.get("thinking"):
+                content = _clean_ai_text(message_obj.get("thinking"))
+
+            if not content:
+                return {
+                    "ok": False,
+                    "error": "The local Gemma4 model returned an empty response. Please try again with more detailed notes.",
+                }
             return {"ok": True, "text": content, "model": model_to_use}
 
         # Handle non-200 responses with clear messages
@@ -97,7 +195,7 @@ def _ollama_chat(messages: list[dict], format_type: str | None = None) -> dict:
             if resp.text:
                 error_msg = resp.text[:200]
 
-        available = get_available_models()
+        available = get_available_models(force_refresh=True)
         avail_str = ", ".join(available) if available else "none detected"
         return {
             "ok": False,
@@ -115,21 +213,26 @@ def _ollama_chat(messages: list[dict], format_type: str | None = None) -> dict:
     except requests.exceptions.Timeout:
         return {
             "ok": False,
-            "error": "Ollama response timed out. The local model took too long to complete.",
+            "error": (
+                "Ollama response timed out. The local model took too long to complete. "
+                "Try summarizing a shorter section of notes."
+            ),
         }
     except Exception as exc:
         return {"ok": False, "error": f"Ollama request error: {exc}"}
 
 
 def check_ollama() -> dict:
-    """Return status dict describing whether Ollama and the configured model are available."""
+    """Return status dict describing whether Ollama, model, and memory state are ready."""
     try:
         available = get_available_models()
         active = resolve_model()
         model_ready = bool(available and (active in available or any(active.split(":")[0] in m for m in available)))
+        warm = is_model_warm(active)
         return {
             "ollama_running": True,
             "model_ready": model_ready,
+            "model_warm": warm,
             "configured_model": Config.OLLAMA_MODEL,
             "active_model": active,
             "available_models": available,
@@ -138,10 +241,28 @@ def check_ollama() -> dict:
         return {
             "ollama_running": False,
             "model_ready": False,
+            "model_warm": False,
             "configured_model": Config.OLLAMA_MODEL,
             "active_model": Config.OLLAMA_MODEL,
             "available_models": [],
         }
+
+
+def get_model_details() -> dict:
+    """Detailed model status for health and settings endpoints."""
+    check = check_ollama()
+    loaded_list = get_loaded_models()
+    active = check["active_model"]
+    active_base = active.split(":")[0].lower()
+    warm_info = next(
+        (m for m in loaded_list if active_base in (m.get("name") or m.get("model") or "").lower()),
+        None
+    )
+    return {
+        **check,
+        "is_loaded": bool(warm_info),
+        "details": warm_info or {},
+    }
 
 
 def summarize(text: str) -> dict:
@@ -161,7 +282,7 @@ def summarize(text: str) -> dict:
         },
     ]
 
-    result = _ollama_chat(messages)
+    result = _ollama_chat(messages, num_predict=1500)
     if result["ok"]:
         return {"ok": True, "summary": result["text"]}
     return result
@@ -188,7 +309,7 @@ def explain(topic: str, context: str = "") -> dict:
         },
     ]
 
-    result = _ollama_chat(messages, format_type="json")
+    result = _ollama_chat(messages, format_type="json", num_predict=600)
     if not result["ok"]:
         return result
 
@@ -203,11 +324,18 @@ def explain(topic: str, context: str = "") -> dict:
                     raw = raw[4:]
                 raw = raw.strip()
         parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {
+                "ok": True,
+                "explanation": parsed.get("explanation", ""),
+                "key_points": parsed.get("key_points", []) if isinstance(parsed.get("key_points"), list) else [],
+                "example": parsed.get("example", ""),
+            }
         return {
             "ok": True,
-            "explanation": parsed.get("explanation", ""),
-            "key_points": parsed.get("key_points", []),
-            "example": parsed.get("example", ""),
+            "explanation": str(parsed),
+            "key_points": [],
+            "example": "",
         }
     except Exception:
         # Graceful fallback if JSON parsing fails
@@ -241,7 +369,7 @@ def generate_quiz(topic: str, num_questions: int = 5, difficulty: str = "medium"
         },
     ]
 
-    result = _ollama_chat(messages, format_type="json")
+    result = _ollama_chat(messages, format_type="json", num_predict=800)
     if not result["ok"]:
         return result
 
@@ -255,8 +383,34 @@ def generate_quiz(topic: str, num_questions: int = 5, difficulty: str = "medium"
                     raw = raw[4:]
                 raw = raw.strip()
         parsed = json.loads(raw)
-        questions = parsed.get("questions", [])
-        return {"ok": True, "questions": questions}
+
+        raw_questions = []
+        if isinstance(parsed, list):
+            raw_questions = parsed
+        elif isinstance(parsed, dict):
+            raw_questions = parsed.get("questions", [])
+            if not isinstance(raw_questions, list):
+                raw_questions = []
+
+        clean_questions = []
+        for q in raw_questions:
+            if isinstance(q, dict) and "question" in q:
+                opts = q.get("options", [])
+                if isinstance(opts, list) and len(opts) >= 2:
+                    try:
+                        c_idx = int(q.get("correct_index", 0))
+                    except (ValueError, TypeError):
+                        c_idx = 0
+                    c_idx = max(0, min(c_idx, len(opts) - 1))
+                    clean_questions.append({
+                        "question": str(q["question"]),
+                        "options": [str(opt) for opt in opts],
+                        "correct_index": c_idx,
+                    })
+
+        if clean_questions:
+            return {"ok": True, "questions": clean_questions}
+        return {"ok": False, "error": "The AI model returned an invalid quiz structure. Please try again."}
     except Exception:
         return {"ok": False, "error": "The AI model returned an invalid quiz structure. Please try again."}
 
@@ -282,7 +436,7 @@ def ask_notes(notes: str, question: str) -> dict:
         },
     ]
 
-    result = _ollama_chat(messages)
+    result = _ollama_chat(messages, num_predict=500)
     if result["ok"]:
         return {"ok": True, "answer": result["text"]}
     return result
